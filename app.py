@@ -16,7 +16,6 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lsa import LsaSummarizer
@@ -45,6 +44,7 @@ BASE_URL     = "https://www.samaa.tv"
 def get_driver():
     """
     Returns a headless Chrome WebDriver configured for Docker.
+    Uses hardcoded chromedriver path installed manually in Dockerfile.
     --no-sandbox            : required when running as root in Docker
     --disable-dev-shm-usage : /dev/shm is too small in Docker by default
     --headless=new          : modern headless mode (Chrome 112+)
@@ -66,7 +66,8 @@ def get_driver():
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
 
-    service = Service(ChromeDriverManager().install())
+    # Hardcoded path — chromedriver installed manually in Dockerfile
+    service = Service("/usr/local/bin/chromedriver")
     driver  = webdriver.Chrome(service=service, options=opts)
     driver.set_page_load_timeout(40)
     return driver
@@ -110,7 +111,7 @@ def scrape_samaa(keyword):
         search_url = f"{BASE_URL}/?s={keyword.replace(' ', '+')}"
         logger.info(f"Opening search URL: {search_url}")
         driver.get(search_url)
-        time.sleep(3)
+        time.sleep(5)
 
         # ── Step 2: Find first article link ──────────────────
         article_url = None
@@ -123,6 +124,7 @@ def scrape_samaa(keyword):
             "article h3 a",
             ".jeg_post_title a",
             ".td-module-title a",
+            ".jeg_post a",
             "h2 a",
             "h3 a",
             ".search-result a",
@@ -158,8 +160,10 @@ def scrape_samaa(keyword):
                     and len(href) > 40
                     and len(text) > 10
                     and href != search_url
+                    and "/news/" in href
                 ):
                     article_url = href
+                    logger.info(f"Found via <a> scan: {article_url}")
                     break
 
         if not article_url:
@@ -169,7 +173,7 @@ def scrape_samaa(keyword):
         # ── Step 3: Open the article ──────────────────────────
         logger.info(f"Navigating to article: {article_url}")
         driver.get(article_url)
-        time.sleep(3)
+        time.sleep(4)
 
         # ── Step 4: Extract title ─────────────────────────────
         title = ""
@@ -177,7 +181,8 @@ def scrape_samaa(keyword):
             "h1.entry-title",
             "h1.post-title",
             "h1",
-            ".article-title"
+            ".article-title",
+            ".jeg_post_title"
         ]:
             try:
                 el    = driver.find_element(By.CSS_SELECTOR, sel)
@@ -200,6 +205,7 @@ def scrape_samaa(keyword):
             ".post-content",
             ".td-post-content",
             ".content-area",
+            ".jeg_post_content",
             "article .content",
             "article",
         ]

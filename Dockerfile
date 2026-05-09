@@ -1,29 +1,65 @@
-FROM python:3.12-slim-bookworm
+# ── Base Image ────────────────────────────────────────────────
+FROM python:3.12-slim
 
+# ── Metadata ──────────────────────────────────────────────────
 LABEL maintainer="FA23-BAI-010"
-LABEL description="SAMAA TV Scraper - FA23-BAI-010"
+LABEL description="SAMAA TV News Scraper API"
 
-ENV PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive
-
-# Install system deps + Chrome
+# ── System Dependencies ───────────────────────────────────────
+# Fixed package names for Debian trixie (newer slim image)
+# libasound2 → libasound2t64
+# libgdk-pixbuf2.0-0 → libgdk-pixbuf-xlib-2.0-0
 RUN apt-get update && apt-get install -y \
-    wget gnupg curl unzip xvfb libnss3 libgconf-2-4 libxi6 libatk1.0-0 \
-    libatk-bridge2.0-0 libcups2 libxcomposite1 libxdamage1 libxrandr2 \
-    libasound2 libpangocairo-1.0-0 libgtk-3-0 fonts-liberation xdg-utils \
-    && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
-    && apt-get update && apt-get install -y google-chrome-stable \
+    wget \
+    gnupg \
+    curl \
+    unzip \
+    ca-certificates \
+    fonts-liberation \
+    libasound2t64 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libcups2 \
+    libdbus-1-3 \
+    libgdk-pixbuf-xlib-2.0-0 \
+    libnspr4 \
+    libnss3 \
+    libx11-6 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxrandr2 \
+    libxss1 \
+    libxtst6 \
+    libgbm1 \
+    xdg-utils \
+    --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
+# ── Install Google Chrome Stable ──────────────────────────────
+RUN wget -q -O /tmp/chrome.deb \
+    https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get update \
+    && apt-get install -y /tmp/chrome.deb \
+    && rm /tmp/chrome.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Working Directory ─────────────────────────────────────────
 WORKDIR /app
 
+# ── Python Dependencies ───────────────────────────────────────
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && \
-    python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('punkt_tab', quiet=True); nltk.download('stopwords', quiet=True)"
+RUN pip install --no-cache-dir -r requirements.txt
 
+# ── Download ChromeDriver at build time ───────────────────────
+RUN python -c "from webdriver_manager.chrome import ChromeDriverManager; ChromeDriverManager().install()"
+
+# ── Copy App Code ─────────────────────────────────────────────
 COPY . .
 
+# ── Expose API Port ───────────────────────────────────────────
 EXPOSE 7000
 
+# ── Start Flask Server ────────────────────────────────────────
 CMD ["python", "app.py"]

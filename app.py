@@ -21,12 +21,10 @@ from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lsa import LsaSummarizer
 import nltk
 
-# Download required NLTK data on startup
 nltk.download('punkt',     quiet=True)
 nltk.download('punkt_tab', quiet=True)
 nltk.download('stopwords', quiet=True)
 
-# ── Flask App Setup ──────────────────────────────────────────
 app = Flask(__name__)
 logging.basicConfig(
     level=logging.INFO,
@@ -34,18 +32,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Constants ────────────────────────────────────────────────
 REGISTRATION = "FA23-BAI-010"
 NEWS_SOURCE  = "SAMAA TV"
 BASE_URL     = "https://www.samaa.tv"
 
+# ── Phrases to filter out from article body ──────────────────
+COOKIE_PHRASES = [
+    "your personal data",
+    "we and our partners",
+    "cookies, unique identifiers",
+    "legitimate interest",
+    "privacy and cookie",
+    "manage or withdraw consent",
+    "geolocation data",
+    "list of partners",
+    "stored by, accessed",
+    "information from your device",
+    "221 partners",
+]
 
-# ── Chrome Driver Factory ────────────────────────────────────
+
+def clean_text(text):
+    """Remove cookie consent and privacy policy sentences."""
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    cleaned = []
+    for sentence in sentences:
+        low = sentence.lower()
+        if not any(phrase in low for phrase in COOKIE_PHRASES):
+            cleaned.append(sentence)
+    return " ".join(cleaned).strip()
+
+
 def get_driver():
-    """
-    Returns a headless Chrome WebDriver configured for Docker.
-    Uses strong anti-detection to avoid CloudFront blocking.
-    """
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
@@ -58,14 +76,12 @@ def get_driver():
     opts.add_argument("--no-first-run")
     opts.add_argument("--no-default-browser-check")
     opts.add_argument("--disable-default-apps")
-    opts.add_argument("--disable-popup-blocking")
     opts.add_argument("--lang=en-US")
     opts.add_argument(
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     )
-    # Hide automation flags so site does not block us
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_experimental_option("prefs", {
@@ -77,7 +93,6 @@ def get_driver():
     driver  = webdriver.Chrome(service=service, options=opts)
     driver.set_page_load_timeout(60)
 
-    # Remove webdriver fingerprint — critical anti-detection step
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
         "source": """
             Object.defineProperty(navigator, 'webdriver', {
@@ -92,12 +107,8 @@ def get_driver():
     return driver
 
 
-# ── Text Summarizer ──────────────────────────────────────────
 def summarize(text, num_sentences=5):
-    """
-    Uses sumy LSA algorithm to extract most important sentences.
-    Falls back to first N sentences if sumy fails.
-    """
+    """LSA summarizer with fallback."""
     try:
         parser     = PlaintextParser.from_string(text, Tokenizer("english"))
         summarizer = LsaSummarizer()
@@ -108,82 +119,94 @@ def summarize(text, num_sentences=5):
     except Exception as e:
         logger.warning(f"sumy failed: {e} — using fallback")
 
-    # Fallback: return first 5 sentences
     sentences = re.split(r'(?<=[.!?])\s+', text)
     return " ".join(sentences[:num_sentences])
 
 
-# ── Core Scraping Logic ──────────────────────────────────────
 def scrape_samaa(keyword):
-    """
-    1. Loads SAMAA TV homepage first (avoids CloudFront block)
-    2. Navigates to search results for keyword
-    3. Finds FIRST RELEVANT article matching the keyword
-    4. Extracts title + body text
-    5. Returns (article_url, full_text)
-    """
     driver = None
     try:
         driver = get_driver()
 
         # ── Step 1: Load homepage first ───────────────────────
-        # Going directly to search triggers CloudFront firewall.
-        # Loading homepage first makes browser look like real user.
-        logger.info("Loading SAMAA TV homepage first...")
+        logger.info("Loading SAMAA TV homepage...")
         driver.get("https://www.samaa.tv")
-        time.sleep(4)
+        time.sleep(3)
 
-        # ── Step 2: Navigate to search results ────────────────
+        # ── Step 2: Go to search page ─────────────────────────
         search_url = f"{BASE_URL}/?s={keyword.replace(' ', '+')}"
-        logger.info(f"Navigating to search: {search_url}")
+        logger.info(f"Searching: {search_url}")
         driver.get(search_url)
-        time.sleep(5)
+        time.sleep(6)
 
-        # ── Step 3: Check if blocked by CloudFront ────────────
-        page_title  = driver.title
-        page_source = driver.page_source
-        logger.info(f"Search page title: {page_title}")
+        logger.info(f"Search page title: {driver.title}")
 
-        if "ERROR" in page_title.upper() or "request could not" in page_source.lower():
-            logger.warning("CloudFront block detected — waiting and retrying...")
-            time.sleep(6)
+        # ── Step 3: Retry if blocked ──────────────────────────
+        if (
+            "error" in driver.title.lower()
+            or "could not" in driver.page_source.lower()[:500]
+        ):
+            logger.warning("Possible block — retrying...")
+            time.sleep(5)
             driver.get(search_url)
             time.sleep(7)
-            logger.info(f"Retry page title: {driver.title}")
 
-        # ── Step 4: Find FIRST RELEVANT article ───────────────
-        # We check the link TEXT contains keyword words so we
-        # don't accidentally pick unrelated trending articles.
-        article_url  = None
-        keyword_words = [w.lower() for w in keyword.split() if len(w) > 2]
-
-        # Strategy A: look for links whose text matches keyword
+        # ── Step 4: Get ALL links from page ───────────────────
         links = driver.find_elements(By.TAG_NAME, "a")
+        logger.info(f"Total links found on search page: {len(links)}")
+
+        # ── Step 5: Find relevant article ─────────────────────
+        # keyword_words = individual meaningful words in keyword
+        keyword_words = [
+            w.lower() for w in keyword.split()
+            if len(w) > 2
+        ]
+        logger.info(f"Looking for keyword words: {keyword_words}")
+
+        article_url = None
+
+        # Strategy A: link TEXT contains any keyword word
         for link in links:
             href = link.get_attribute("href") or ""
             text = link.text.strip().lower()
             if (
                 "samaa.tv" in href
                 and len(href) > 40
-                and len(text) > 15
+                and len(text) > 10
                 and href != search_url
                 and any(word in text for word in keyword_words)
             ):
                 article_url = href
-                logger.info(f"Found relevant article (keyword match): {article_url}")
+                logger.info(f"Strategy A match: {article_url}")
                 break
 
-        # Strategy B: if no keyword match found, take first
-        # news article on the search results page
+        # Strategy B: keyword word in the URL itself
         if not article_url:
-            logger.warning("No keyword-matching link — taking first news article")
+            logger.warning("Strategy A failed — trying URL keyword match")
+            for link in links:
+                href = (link.get_attribute("href") or "").lower()
+                text = link.text.strip()
+                if (
+                    "samaa.tv" in href
+                    and len(href) > 40
+                    and len(text) > 10
+                    and href != search_url
+                    and any(word in href for word in keyword_words)
+                ):
+                    article_url = href
+                    logger.info(f"Strategy B match: {article_url}")
+                    break
+
+        # Strategy C: just take first news article on page
+        if not article_url:
+            logger.warning("Strategy B failed — taking first news link")
             for link in links:
                 href = link.get_attribute("href") or ""
                 text = link.text.strip()
                 if (
                     "samaa.tv" in href
                     and len(href) > 40
-                    and len(text) > 15
+                    and len(text) > 10
                     and href != search_url
                     and any(x in href for x in [
                         "/news/", "/pakistan/", "/world/",
@@ -192,55 +215,44 @@ def scrape_samaa(keyword):
                     ])
                 ):
                     article_url = href
-                    logger.info(f"Found first news article: {article_url}")
+                    logger.info(f"Strategy C match: {article_url}")
                     break
 
         if not article_url:
-            logger.error("No article link found on search page.")
+            logger.error("All strategies failed — no article found")
             return None, None
 
-        # ── Step 5: Open the article ──────────────────────────
-        logger.info(f"Opening article: {article_url}")
+        # ── Step 6: Open the article ──────────────────────────
+        logger.info(f"Opening: {article_url}")
         driver.get(article_url)
         time.sleep(4)
 
-        # ── Step 6: Extract title ─────────────────────────────
+        # ── Step 7: Extract title ─────────────────────────────
         title = ""
         for sel in [
-            "h1.entry-title",
-            "h1.post-title",
-            "h1",
-            ".article-title",
-            ".jeg_post_title"
+            "h1.entry-title", "h1.post-title",
+            "h1", ".article-title", ".jeg_post_title"
         ]:
             try:
                 el    = driver.find_element(By.CSS_SELECTOR, sel)
                 title = el.text.strip()
                 if title:
-                    logger.info(f"Title via [{sel}]: {title}")
+                    logger.info(f"Title: {title}")
                     break
             except Exception:
                 continue
 
         if not title:
             title = driver.title.strip()
-            logger.info(f"Title from browser tab: {title}")
 
-        # ── Step 7: Extract article body ──────────────────────
+        # ── Step 8: Extract body ──────────────────────────────
         body = ""
-        body_selectors = [
-            ".story-detail",
-            ".entry-content",
-            ".article-content",
-            ".post-content",
-            ".td-post-content",
-            ".jeg_post_content",
-            ".content-area",
-            "article .content",
-            "article",
-        ]
-
-        for sel in body_selectors:
+        for sel in [
+            ".story-detail", ".entry-content",
+            ".article-content", ".post-content",
+            ".td-post-content", ".jeg_post_content",
+            ".content-area", "article"
+        ]:
             try:
                 container  = driver.find_element(By.CSS_SELECTOR, sel)
                 paragraphs = container.find_elements(By.TAG_NAME, "p")
@@ -250,14 +262,14 @@ def scrape_samaa(keyword):
                     if p.text.strip()
                 )
                 if len(body) > 150:
-                    logger.info(f"Body via [{sel}], length={len(body)} chars")
+                    logger.info(f"Body via [{sel}]: {len(body)} chars")
                     break
             except Exception:
                 continue
 
-        # Fallback: all <p> tags on entire page
+        # Fallback
         if len(body) < 150:
-            logger.warning("Body selectors failed — scanning all <p> tags")
+            logger.warning("Using all <p> tags fallback")
             paragraphs = driver.find_elements(By.TAG_NAME, "p")
             body = " ".join(
                 p.text.strip()
@@ -265,8 +277,10 @@ def scrape_samaa(keyword):
                 if len(p.text.strip()) > 30
             )
 
-        full_text = f"{title}. {body}".strip()
-        logger.info(f"Total text length: {len(full_text)} chars")
+        # ── Step 9: Clean cookie text from body ───────────────
+        body      = clean_text(body)
+        full_text = clean_text(f"{title}. {body}".strip())
+        logger.info(f"Final text length: {len(full_text)} chars")
         return article_url, full_text
 
     except Exception as e:
@@ -278,7 +292,6 @@ def scrape_samaa(keyword):
             driver.quit()
 
 
-# ── API Endpoint ─────────────────────────────────────────────
 @app.route("/get", methods=["GET"])
 def get_news():
     keyword = request.args.get("keyword", "").strip()
@@ -288,33 +301,26 @@ def get_news():
             {"error": "Missing required query parameter: keyword"}
         ), 400
 
-    logger.info(f"=== New request: keyword='{keyword}' ===")
+    logger.info(f"=== Request: keyword='{keyword}' ===")
 
     url, full_text = scrape_samaa(keyword)
 
     if not url or not full_text:
         return jsonify({
-            "error": (
-                "Could not find or scrape an article "
-                "for the given keyword."
-            )
+            "error": "Could not find or scrape an article for the given keyword."
         }), 404
 
     summary = summarize(full_text)
 
-    response = {
+    return jsonify({
         "registration": REGISTRATION,
         "newssource":   NEWS_SOURCE,
         "keyword":      keyword,
         "url":          url,
         "summary":      summary
-    }
-
-    logger.info(f"=== Response ready for keyword='{keyword}' ===")
-    return jsonify(response), 200
+    }), 200
 
 
-# ── Health Check ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({
@@ -325,7 +331,6 @@ def health():
     })
 
 
-# ── Entry Point ───────────────────────────────────────────────
 if __name__ == "__main__":
     logger.info("Starting SAMAA TV Scraper API on 0.0.0.0:7000 ...")
     app.run(host="0.0.0.0", port=7000, debug=False)

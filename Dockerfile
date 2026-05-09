@@ -6,9 +6,6 @@ LABEL maintainer="FA23-BAI-010"
 LABEL description="SAMAA TV News Scraper API"
 
 # ── System Dependencies ───────────────────────────────────────
-# Fixed package names for Debian trixie (newer slim image)
-# libasound2 → libasound2t64
-# libgdk-pixbuf2.0-0 → libgdk-pixbuf-xlib-2.0-0
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
@@ -45,15 +42,22 @@ RUN wget -q -O /tmp/chrome.deb \
     && rm /tmp/chrome.deb \
     && rm -rf /var/lib/apt/lists/*
 
+# ── Install Matching ChromeDriver Manually ────────────────────
+RUN CHROME_VERSION=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+') && \
+    DRIVER_VERSION=$(curl -s "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_VERSION%%.*}") && \
+    wget -q "https://storage.googleapis.com/chrome-for-testing-public/${DRIVER_VERSION}/linux64/chromedriver-linux64.zip" && \
+    unzip chromedriver-linux64.zip && \
+    mv chromedriver-linux64/chromedriver /usr/local/bin/chromedriver && \
+    chmod +x /usr/local/bin/chromedriver && \
+    rm -rf chromedriver-linux64.zip chromedriver-linux64 && \
+    chromedriver --version
+
 # ── Working Directory ─────────────────────────────────────────
 WORKDIR /app
 
 # ── Python Dependencies ───────────────────────────────────────
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-# ── Download ChromeDriver at build time ───────────────────────
-RUN python -c "from webdriver_manager.chrome import ChromeDriverManager; ChromeDriverManager().install()"
 
 # ── Copy App Code ─────────────────────────────────────────────
 COPY . .

@@ -44,10 +44,7 @@ BASE_URL     = "https://www.samaa.tv"
 def get_driver():
     """
     Returns a headless Chrome WebDriver configured for Docker.
-    Uses hardcoded chromedriver path installed manually in Dockerfile.
-    --no-sandbox            : required when running as root in Docker
-    --disable-dev-shm-usage : /dev/shm is too small in Docker by default
-    --headless=new          : modern headless mode (Chrome 112+)
+    Uses strong anti-detection to avoid CloudFront blocking.
     """
     opts = Options()
     opts.add_argument("--headless=new")
@@ -57,26 +54,48 @@ def get_driver():
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--disable-web-security")
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--no-default-browser-check")
+    opts.add_argument("--disable-default-apps")
+    opts.add_argument("--disable-popup-blocking")
+    opts.add_argument("--lang=en-US")
     opts.add_argument(
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     )
-    # Hide automation flags so the site does not block us
+    # Hide automation flags so site does not block us
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_experimental_option("prefs", {
+        "profile.default_content_setting_values.notifications": 2,
+        "credentials_enable_service": False,
+    })
 
-    # Hardcoded path — chromedriver installed manually in Dockerfile
     service = Service("/usr/local/bin/chromedriver")
     driver  = webdriver.Chrome(service=service, options=opts)
-    driver.set_page_load_timeout(40)
+    driver.set_page_load_timeout(60)
+
+    # Remove webdriver fingerprint — critical anti-detection step
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": """
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+            window.chrome = { runtime: {} };
+        """
+    })
     return driver
 
 
 # ── Text Summarizer ──────────────────────────────────────────
 def summarize(text, num_sentences=5):
     """
-    Uses sumy LSA algorithm to extract the most important sentences.
+    Uses sumy LSA algorithm to extract most important sentences.
     Falls back to first N sentences if sumy fails.
     """
     try:
@@ -89,7 +108,7 @@ def summarize(text, num_sentences=5):
     except Exception as e:
         logger.warning(f"sumy failed: {e} — using fallback")
 
-    # Fallback: first 5 sentences
+    # Fallback: return first 5 sentences
     sentences = re.split(r'(?<=[.!?])\s+', text)
     return " ".join(sentences[:num_sentences])
 
@@ -97,85 +116,95 @@ def summarize(text, num_sentences=5):
 # ── Core Scraping Logic ──────────────────────────────────────
 def scrape_samaa(keyword):
     """
-    1. Opens SAMAA TV search page for the keyword
-    2. Finds and clicks the first article link
-    3. Extracts title + body text
-    4. Returns (article_url, full_text)
+    1. Loads SAMAA TV homepage first (avoids CloudFront block)
+    2. Navigates to search results for keyword
+    3. Finds FIRST RELEVANT article matching the keyword
+    4. Extracts title + body text
+    5. Returns (article_url, full_text)
     """
     driver = None
     try:
         driver = get_driver()
-        wait   = WebDriverWait(driver, 20)
 
-        # ── Step 1: Open search results page ─────────────────
+        # ── Step 1: Load homepage first ───────────────────────
+        # Going directly to search triggers CloudFront firewall.
+        # Loading homepage first makes browser look like real user.
+        logger.info("Loading SAMAA TV homepage first...")
+        driver.get("https://www.samaa.tv")
+        time.sleep(4)
+
+        # ── Step 2: Navigate to search results ────────────────
         search_url = f"{BASE_URL}/?s={keyword.replace(' ', '+')}"
-        logger.info(f"Opening search URL: {search_url}")
+        logger.info(f"Navigating to search: {search_url}")
         driver.get(search_url)
         time.sleep(5)
 
-        # ── Step 2: Find first article link ──────────────────
-        article_url = None
+        # ── Step 3: Check if blocked by CloudFront ────────────
+        page_title  = driver.title
+        page_source = driver.page_source
+        logger.info(f"Search page title: {page_title}")
 
-        candidate_selectors = [
-            "h2.entry-title a",
-            "h3.entry-title a",
-            ".post-title a",
-            "article h2 a",
-            "article h3 a",
-            ".jeg_post_title a",
-            ".td-module-title a",
-            ".jeg_post a",
-            "h2 a",
-            "h3 a",
-            ".search-result a",
-            "a.title",
-        ]
+        if "ERROR" in page_title.upper() or "request could not" in page_source.lower():
+            logger.warning("CloudFront block detected — waiting and retrying...")
+            time.sleep(6)
+            driver.get(search_url)
+            time.sleep(7)
+            logger.info(f"Retry page title: {driver.title}")
 
-        for selector in candidate_selectors:
-            try:
-                elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                for el in elements:
-                    href = el.get_attribute("href") or ""
-                    if "samaa.tv" in href and len(href) > 30:
-                        article_url = href
-                        logger.info(
-                            f"Found article: {article_url} "
-                            f"via selector [{selector}]"
-                        )
-                        break
-                if article_url:
-                    break
-            except Exception:
-                continue
+        # ── Step 4: Find FIRST RELEVANT article ───────────────
+        # We check the link TEXT contains keyword words so we
+        # don't accidentally pick unrelated trending articles.
+        article_url  = None
+        keyword_words = [w.lower() for w in keyword.split() if len(w) > 2]
 
-        # Last resort: scan all <a> tags on the page
+        # Strategy A: look for links whose text matches keyword
+        links = driver.find_elements(By.TAG_NAME, "a")
+        for link in links:
+            href = link.get_attribute("href") or ""
+            text = link.text.strip().lower()
+            if (
+                "samaa.tv" in href
+                and len(href) > 40
+                and len(text) > 15
+                and href != search_url
+                and any(word in text for word in keyword_words)
+            ):
+                article_url = href
+                logger.info(f"Found relevant article (keyword match): {article_url}")
+                break
+
+        # Strategy B: if no keyword match found, take first
+        # news article on the search results page
         if not article_url:
-            logger.warning("Named selectors failed — scanning all <a> tags")
-            links = driver.find_elements(By.TAG_NAME, "a")
+            logger.warning("No keyword-matching link — taking first news article")
             for link in links:
                 href = link.get_attribute("href") or ""
                 text = link.text.strip()
                 if (
                     "samaa.tv" in href
                     and len(href) > 40
-                    and len(text) > 10
+                    and len(text) > 15
                     and href != search_url
-                    and "/news/" in href
+                    and any(x in href for x in [
+                        "/news/", "/pakistan/", "/world/",
+                        "/sport/", "/business/", "/entertainment/",
+                        "samaa.tv/20"
+                    ])
                 ):
                     article_url = href
-                    logger.info(f"Found via <a> scan: {article_url}")
+                    logger.info(f"Found first news article: {article_url}")
                     break
 
         if not article_url:
-            logger.error("No article link found on search results page.")
+            logger.error("No article link found on search page.")
             return None, None
 
-        # ── Step 3: Open the article ──────────────────────────
-        logger.info(f"Navigating to article: {article_url}")
+        # ── Step 5: Open the article ──────────────────────────
+        logger.info(f"Opening article: {article_url}")
         driver.get(article_url)
         time.sleep(4)
 
-        # ── Step 4: Extract title ─────────────────────────────
+        # ── Step 6: Extract title ─────────────────────────────
         title = ""
         for sel in [
             "h1.entry-title",
@@ -188,15 +217,16 @@ def scrape_samaa(keyword):
                 el    = driver.find_element(By.CSS_SELECTOR, sel)
                 title = el.text.strip()
                 if title:
+                    logger.info(f"Title via [{sel}]: {title}")
                     break
             except Exception:
                 continue
 
         if not title:
             title = driver.title.strip()
-        logger.info(f"Title: {title}")
+            logger.info(f"Title from browser tab: {title}")
 
-        # ── Step 5: Extract article body ──────────────────────
+        # ── Step 7: Extract article body ──────────────────────
         body = ""
         body_selectors = [
             ".story-detail",
@@ -204,8 +234,8 @@ def scrape_samaa(keyword):
             ".article-content",
             ".post-content",
             ".td-post-content",
-            ".content-area",
             ".jeg_post_content",
+            ".content-area",
             "article .content",
             "article",
         ]
@@ -220,17 +250,14 @@ def scrape_samaa(keyword):
                     if p.text.strip()
                 )
                 if len(body) > 150:
-                    logger.info(
-                        f"Body extracted via [{sel}], "
-                        f"length={len(body)} chars"
-                    )
+                    logger.info(f"Body via [{sel}], length={len(body)} chars")
                     break
             except Exception:
                 continue
 
-        # Absolute fallback: every <p> on the whole page
+        # Fallback: all <p> tags on entire page
         if len(body) < 150:
-            logger.warning("Body selectors failed — using all <p> tags")
+            logger.warning("Body selectors failed — scanning all <p> tags")
             paragraphs = driver.find_elements(By.TAG_NAME, "p")
             body = " ".join(
                 p.text.strip()
@@ -239,7 +266,7 @@ def scrape_samaa(keyword):
             )
 
         full_text = f"{title}. {body}".strip()
-        logger.info(f"Total extracted text length: {len(full_text)} chars")
+        logger.info(f"Total text length: {len(full_text)} chars")
         return article_url, full_text
 
     except Exception as e:
@@ -287,7 +314,7 @@ def get_news():
     return jsonify(response), 200
 
 
-# ── Health Check Endpoint ─────────────────────────────────────
+# ── Health Check ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({

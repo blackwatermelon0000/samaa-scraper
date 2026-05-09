@@ -6,6 +6,9 @@ LABEL maintainer="FA23-BAI-010"
 LABEL description="SAMAA TV News Scraper API"
 
 # ── System Dependencies ───────────────────────────────────────
+# Fixed package names for Debian trixie (newer slim image)
+# libasound2 → libasound2t64
+# libgdk-pixbuf2.0-0 → libgdk-pixbuf-xlib-2.0-0
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
@@ -13,12 +16,12 @@ RUN apt-get update && apt-get install -y \
     unzip \
     ca-certificates \
     fonts-liberation \
-    libasound2 \
+    libasound2t64 \
     libatk-bridge2.0-0 \
     libatk1.0-0 \
     libcups2 \
     libdbus-1-3 \
-    libgdk-pixbuf2.0-0 \
+    libgdk-pixbuf-xlib-2.0-0 \
     libnspr4 \
     libnss3 \
     libx11-6 \
@@ -29,6 +32,7 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 \
     libxss1 \
     libxtst6 \
+    libgbm1 \
     xdg-utils \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*

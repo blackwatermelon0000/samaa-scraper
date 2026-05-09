@@ -1,8 +1,7 @@
-flask==3.0.3
-selenium==4.21.0
-sumy==0.11.0
-nltk==3.8.1
-beautifulsoup4==4.12.3
-lxml==5.2.2
-requests==2.32.3
-numpy==1.26.4
+flask==3.0.*
+selenium==4.25.*
+webdriver-manager==4.0.*
+sumy==0.11.*
+nltk==3.9.*
+beautifulsoup4==4.12.*
+lxml==5.3.*
